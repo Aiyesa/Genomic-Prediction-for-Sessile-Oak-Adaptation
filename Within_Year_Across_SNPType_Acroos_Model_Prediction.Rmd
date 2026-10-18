@@ -1,0 +1,320 @@
+---
+title: "Within Year Across Site Prediction"
+author: "Aiyesa, Leke Victor"
+date: "2026-10-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## GENOMIC PREDICTION: GBLUP (RKHS) and BRR on three marker sets per trait:
+
+   (1) GWAS  : GWAS-selected SNPs
+   (2) Random: random SNPs, same number as the GWAS set (control)
+   (3) All   : all polymorphic SNPs
+
+## Model: y = Xb + g + Wp + e
+   X = Origin * Trial + Julian (fixed), W = Trial:Repeat (random plot)
+   g = u ~ N(0, G s2u)  (GBLUP)   or   Z beta (BRR)
+
+## Efficiency:
+  - genotype file is read/transposed once; genotypes are processed in
+    SNP chunks (two light passes), geno2 is then removed
+  - ONE centred, mean-imputed marker matrix; G (all SNPs) is accumulated
+    chunk-wise; only the GWAS/random columns are kept in a small matrix
+  - design matrices and CV folds are built once per trait and are
+    identical across marker sets (paired comparison)
+  - results are written per trait x marker set; finished ones are skipped
+    so an interrupted run can be resumed
+
+
+
+```{r cars}
+############################################################
+## LOAD PACKAGES
+############################################################
+
+library(BGLR)
+library(caret)
+library(dplyr)
+
+## ---------------- settings ----------------
+run_all_brr <- TRUE      # BRR on all SNPs needs n x 582,900 doubles in RAM
+                         # (~2.3 GB per 500 individuals); FALSE = GBLUP only
+marker_sets <- c("GWAS", "Random", "All")
+chunk_size  <- 50000
+runs        <- c(3647, 123, 5, 638166, 600)      # CV seeds
+n_iter <- 5000; burn_in <- 2000; thin <- 10
+out_dir  <- "GP_results"
+bglr_tmp <- file.path(tempdir(), "bglr_")
+dir.create(out_dir, showWarnings = FALSE)
+
+
+############################################################
+## LOAD PHENOTYPE + COVARIATES
+############################################################
+
+pheno <- read.table("phenotype_data_746.txt", header = TRUE, check.names = FALSE)
+for (i in 2:ncol(pheno)) pheno[, i] <- as.numeric(pheno[, i])
+colnames(pheno)[1] <- "taxa"
+pheno$taxa <- gsub("-", "_", pheno$taxa)
+
+cov <- read.table("phenotype_data_746_plot_info.txt", header = TRUE, check.names = FALSE)
+cov <- cov[, c("Name", "Origin", "Trial", "Repeat", "julian_2021", "julian_2022")]
+colnames(cov)[colnames(cov) == "Name"] <- "taxa"
+cov$taxa <- gsub("-", "_", cov$taxa)
+
+cov$Trial  <- factor(cov$Trial, levels = c("Harz", "Unterlüß"))
+cov$Repeat <- factor(ifelse(cov$Repeat %in% c("repeat1", "repeat4"), 1,
+                     ifelse(cov$Repeat %in% c("repeat2", "repeat5"), 2, 3)))
+cov$Origin <- factor(dplyr::recode(
+  cov$Origin,
+  "Horbylunde, Denmark" = 1, "Dean Sutton Bottow, Great britain" = 2,
+  "Recklinghausen, Germany" = 3, "Dean Blackney, Great britain" = 4,
+  "Elmstein-Nord, Germany" = 5, "Dymock, Great britain" = 6,
+  "Bussieres, France" = 7, "Voillé, Frankreich" = 8), levels = 1:8)
+
+if (anyDuplicated(cov$taxa) > 0) stop("Duplicated taxa in covariate data")
+
+## trait columns: every *_2021 / *_2022 phenotype column (no hard-coded indices)
+trait_names <- setdiff(grep("_(2021|2022)$", colnames(pheno), value = TRUE),
+                       c("julian_2021", "julian_2022"))
+cat("Traits:", paste(trait_names, collapse = ", "), "\n")
+
+
+############################################################
+## LOAD GENOTYPES
+############################################################
+
+geno <- read.table("genotype_data_582900.txt", header = TRUE, check.names = FALSE)
+colnames(geno) <- gsub("^X", "", colnames(geno))
+geno2 <- data.frame(taxa = colnames(geno)[-c(1:9)],
+                    t(geno[, -c(1:9)]), check.names = FALSE)
+colnames(geno2)[-1] <- geno$ID
+geno2$taxa <- gsub("-", "_", geno2$taxa)
+rm(geno); invisible(gc())
+if (anyDuplicated(geno2$taxa) > 0) stop("Duplicated taxa in genotype data")
+
+taxa_all <- geno2$taxa
+n_ind    <- nrow(geno2)
+snp_cols <- setdiff(colnames(geno2), "taxa")
+chunks   <- seq(1, length(snp_cols), by = chunk_size)
+
+
+############################################################
+## PASS 1: allele frequencies, polymorphic SNPs
+############################################################
+
+p_all <- numeric(length(snp_cols))
+for (s in chunks) {
+  ii <- s:min(s + chunk_size - 1, length(snp_cols))
+  Mc <- as.matrix(geno2[, snp_cols[ii], drop = FALSE])
+  storage.mode(Mc) <- "numeric"
+  p_all[ii] <- colMeans(Mc, na.rm = TRUE) / 2
+  rm(Mc)
+}
+keep_all   <- is.finite(p_all) & p_all > 0 & p_all < 1
+kept_names <- snp_cols[keep_all]
+p_kept     <- setNames(p_all[keep_all], kept_names)
+denom_all  <- sum(2 * p_kept * (1 - p_kept))
+cat("Polymorphic SNPs:", length(kept_names), "of", length(snp_cols), "\n")
+
+
+############################################################
+## MARKER SETS: GWAS-selected and random (same size, non-GWAS SNPs)
+############################################################
+
+read_snps <- function(trait_name) {
+  x <- read.table(paste0("selected_snps_", trait_name, ".txt"),
+                  header = TRUE, sep = "\t", fill = TRUE, stringsAsFactors = FALSE)
+  sub("^[0-9]+\\s+", "", x$x)
+}
+
+rand_seeds <- c(runs, 777)                # one seed per trait (original seeds kept)
+gwas_list <- list(); random_list <- list()
+for (k in seq_along(trait_names)) {
+  tn <- trait_names[k]
+  gw <- intersect(read_snps(tn), kept_names)           # drop missing/monomorphic
+  set.seed(rand_seeds[k])
+  rd <- sample(setdiff(kept_names, gw), length(gw))
+  gwas_list[[tn]]   <- gw
+  random_list[[tn]] <- rd
+  cat(tn, ": GWAS SNPs =", length(gw), "| random SNPs =", length(rd), "\n")
+}
+needed <- unique(c(unlist(gwas_list), unlist(random_list)))
+
+
+############################################################
+## PASS 2: centre + mean-impute; accumulate G (all SNPs);
+## keep only needed columns (and optionally everything for BRR)
+############################################################
+
+G_num <- matrix(0, n_ind, n_ind)
+M_all <- if (run_all_brr) matrix(0, n_ind, length(kept_names)) else NULL
+sub_parts <- list(); sub_names <- character(0)
+col_pos <- 0L; n_miss <- 0
+
+for (s in chunks) {
+  ii <- s:min(s + chunk_size - 1, length(snp_cols))
+  kk <- keep_all[ii]
+  if (!any(kk)) next
+  nm <- snp_cols[ii][kk]
+  Mc <- as.matrix(geno2[, nm, drop = FALSE])
+  storage.mode(Mc) <- "numeric"
+  Mc <- sweep(Mc, 2, 2 * p_kept[nm], "-")              # centre
+  na <- is.na(Mc); n_miss <- n_miss + sum(na); Mc[na] <- 0   # mean imputation
+
+  G_num <- G_num + tcrossprod(Mc)
+  if (run_all_brr) M_all[, col_pos + seq_len(ncol(Mc))] <- Mc
+  sel <- nm %in% needed
+  if (any(sel)) { sub_parts[[length(sub_parts) + 1]] <- Mc[, sel, drop = FALSE]
+                  sub_names <- c(sub_names, nm[sel]) }
+  col_pos <- col_pos + ncol(Mc)
+  cat("SNP chunk", s, "done | SNPs stored:", col_pos, "\n")
+  rm(Mc, na)
+}
+rm(geno2); invisible(gc())
+
+M_sub <- do.call(cbind, sub_parts); colnames(M_sub) <- sub_names
+rownames(M_sub) <- taxa_all
+if (run_all_brr) rownames(M_all) <- taxa_all
+rm(sub_parts)
+
+G_all <- G_num / denom_all
+rownames(G_all) <- colnames(G_all) <- taxa_all
+rm(G_num); invisible(gc())
+if (!all(is.finite(G_all))) stop("G (all SNPs) contains NA/NaN/Inf")
+cat("Missing genotypes imputed:", n_miss, "\n")
+saveRDS(G_all, file.path(out_dir, "G_matrix_all_SNPs.rds"))
+
+
+############################################################
+## HELPERS
+############################################################
+
+calc_accuracy <- function(obs, pred) {
+  ok <- complete.cases(obs, pred); obs <- obs[ok]; pred <- pred[ok]
+  if (length(obs) < 2) return(c(Correlation = NA, RMSE = NA))
+  c(Correlation = cor(obs, pred), RMSE = sqrt(mean((obs - pred)^2)))
+}
+
+fit_eval <- function(ETA, yNa, y, test) {
+  fit <- BGLR(y = yNa, ETA = ETA, nIter = n_iter, burnIn = burn_in,
+              thin = thin, verbose = FALSE, saveAt = bglr_tmp)
+  acc <- calc_accuracy(y[test], fit$yHat[test])
+  rm(fit); invisible(gc())
+  acc
+}
+
+make_row <- function(trait, set, model, f, run, acc)
+  data.frame(trait = trait, marker_set = set, model = model, Fold = f, Run = run,
+             Pred = round(acc["Correlation"], 4), Error = round(acc["RMSE"], 4),
+             row.names = NULL)
+
+## marker inputs for one trait x marker set, in the order of trait_geno
+get_markers <- function(set, trait_name, taxa_trait) {
+  idx <- match(taxa_trait, taxa_all)
+  if (set == "All") {
+    M <- NULL
+    if (run_all_brr)
+      M <- if (identical(idx, seq_len(n_ind))) M_all else M_all[idx, , drop = FALSE]
+    return(list(G = G_all[idx, idx], M = M, n_snp = length(kept_names)))
+  }
+  snps <- if (set == "GWAS") gwas_list[[trait_name]] else random_list[[trait_name]]
+  M <- M_sub[idx, snps, drop = FALSE]
+  G <- tcrossprod(M) / sum(2 * p_kept[snps] * (1 - p_kept[snps]))
+  list(G = G, M = M, n_snp = length(snps))
+}
+
+
+############################################################
+## LOOP OVER TRAITS x MARKER SETS
+############################################################
+
+for (trait_name in trait_names) {
+
+  cat("\n\n========================================\nTrait:", trait_name,
+      "\n========================================\n")
+
+  julian_var <- if (grepl("_2021$", trait_name)) "julian_2021" else "julian_2022"
+
+  trait_i <- pheno[, c("taxa", trait_name), drop = FALSE] %>%
+    filter(!is.na(.data[[trait_name]]))
+  trait_geno <- data.frame(taxa = taxa_all) %>%
+    left_join(cov, by = "taxa") %>%
+    left_join(trait_i, by = "taxa") %>%
+    filter(!is.na(Trial), !is.na(Repeat), !is.na(Origin), !is.na(.data[[julian_var]]),
+           !is.na(.data[[trait_name]]))
+  cat("Individuals used:", nrow(trait_geno), "\n")
+
+  y <- trait_geno[[trait_name]]
+  X_fixed  <- model.matrix(as.formula(paste0("~ Origin * Trial + ", julian_var)),
+                           data = trait_geno)
+  W_repeat <- model.matrix(~ 0 + interaction(Trial, Repeat), data = trait_geno)
+
+  ## identical folds for every marker set (paired comparison)
+  folds_list <- lapply(runs, function(s) { set.seed(s)
+    createFolds(y = y, k = 10, list = TRUE, returnTrain = FALSE) })
+
+  for (set in marker_sets) {
+
+    out_file <- file.path(out_dir, paste0("Pred_res_", set, "_", trait_name, ".txt"))
+    if (file.exists(out_file)) { cat("Skipping (done):", out_file, "\n"); next }
+
+    mk <- get_markers(set, trait_name, trait_geno$taxa)
+    cat("\n--- Marker set:", set, "| SNPs:", mk$n_snp, "---\n")
+    if (!all(is.finite(mk$G))) stop("G contains NA/NaN/Inf: ", trait_name, " / ", set)
+
+    do_brr <- !is.null(mk$M)
+    res <- NULL
+
+    for (run in seq_along(runs)) {
+      for (f in seq_along(folds_list[[run]])) {
+        test <- folds_list[[run]][[f]]
+        yNa <- y; yNa[test] <- NA
+
+        ## GBLUP: y = Xb + u + Wp + e
+        acc_G <- fit_eval(list(list(model = "FIXED", X = X_fixed),
+                               list(model = "RKHS",  K = mk$G),
+                               list(model = "BRR",   X = W_repeat)), yNa, y, test)
+        res <- rbind(res, make_row(trait_name, set, "GBLUP", f, run, acc_G))
+
+        ## BRR: y = Xb + Zg + Wp + e
+        acc_B <- c(Correlation = NA, RMSE = NA)
+        if (do_brr) {
+          acc_B <- fit_eval(list(list(model = "FIXED", X = X_fixed),
+                                 list(model = "BRR",   X = mk$M),
+                                 list(model = "BRR",   X = W_repeat)), yNa, y, test)
+          res <- rbind(res, make_row(trait_name, set, "BRR", f, run, acc_B))
+        }
+        cat(sprintf("%s | %s | run %d fold %2d | GBLUP r = %.3f | BRR r = %.3f\n",
+                    trait_name, set, run, f, acc_G["Correlation"], acc_B["Correlation"]))
+      }
+    }
+
+    write.table(res, out_file, row.names = FALSE, quote = FALSE, sep = "\t")
+    print(res %>% group_by(marker_set, model) %>%
+            summarise(mean_r = mean(Pred, na.rm = TRUE), sd_r = sd(Pred, na.rm = TRUE),
+                      mean_RMSE = mean(Error, na.rm = TRUE), .groups = "drop"))
+    rm(mk, res); invisible(gc())
+  }
+}
+
+
+############################################################
+## COMBINE ALL RESULTS
+############################################################
+
+files <- list.files(out_dir, pattern = "^Pred_res_.*\\.txt$", full.names = TRUE)
+all_res <- do.call(rbind, lapply(files, read.table, header = TRUE, sep = "\t"))
+write.table(all_res, file.path(out_dir, "Pred_res_ALL.txt"),
+            row.names = FALSE, quote = FALSE, sep = "\t")
+
+all_res %>% group_by(trait, marker_set, model) %>%
+  summarise(mean_r = mean(Pred, na.rm = TRUE), sd_r = sd(Pred, na.rm = TRUE),
+            mean_RMSE = mean(Error, na.rm = TRUE), .groups = "drop") %>%
+  print(n = Inf)
+```
+
