@@ -5,10 +5,6 @@ date: "2026-10-18"
 output: html_document
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
-```
-
 ## GENOMIC PREDICTION: GBLUP (RKHS) and BRR on three marker sets per trait:
 
    (1) GWAS  : GWAS-selected SNPs
