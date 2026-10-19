@@ -310,5 +310,4 @@ all_res %>% group_by(trait, marker_set, model) %>%
   summarise(mean_r = mean(Pred, na.rm = TRUE), sd_r = sd(Pred, na.rm = TRUE),
             mean_RMSE = mean(Error, na.rm = TRUE), .groups = "drop") %>%
   print(n = Inf)
-```
 
