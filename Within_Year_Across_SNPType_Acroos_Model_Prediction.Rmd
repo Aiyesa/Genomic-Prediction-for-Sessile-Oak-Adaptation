@@ -26,8 +26,6 @@ output: html_document
     so an interrupted run can be resumed
 
 
-
-```{r cars}
 ############################################################
 ## LOAD PACKAGES
 ############################################################
